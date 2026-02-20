@@ -74,4 +74,60 @@ export class TwitterStream {
     });
     return result.data;
   }
+
+  async postReply(tweetId: string, text: string): Promise<any> {
+    try {
+      const result = await this.client.post('statuses/update', {
+        status: text,
+        in_reply_to_status_id: tweetId,
+        auto_populate_reply_metadata: true,
+      });
+      return result.data;
+    } catch (error) {
+      console.error(`Error posting reply to tweet ${tweetId}:`, error);
+      throw error;
+    }
+  }
+
+  async retweet(tweetId: string): Promise<any> {
+    try {
+      const result = await this.client.post('statuses/retweet/:id', { id: tweetId });
+      return result.data;
+    } catch (error) {
+      console.error(`Error retweeting ${tweetId}:`, error);
+      throw error;
+    }
+  }
+
+  async like(tweetId: string): Promise<any> {
+    try {
+      const result = await this.client.post('favorites/create', { id: tweetId });
+      return result.data;
+    } catch (error) {
+      console.error(`Error liking tweet ${tweetId}:`, error);
+      throw error;
+    }
+  }
+
+  async unlike(tweetId: string): Promise<any> {
+    try {
+      const result = await this.client.post('favorites/destroy', { id: tweetId });
+      return result.data;
+    } catch (error) {
+      console.error(`Error unliking tweet ${tweetId}:`, error);
+      throw error;
+    }
+  }
+
+  async getUserRateLimitStatus(): Promise<any> {
+    try {
+      const result = await this.client.get('application/rate_limit_status', {
+        resources: 'statuses,users,favorites'
+      });
+      return result.data;
+    } catch (error) {
+      console.error('Error checking rate limits:', error);
+      return null;
+    }
+  }
 }

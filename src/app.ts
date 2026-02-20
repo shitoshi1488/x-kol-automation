@@ -1,10 +1,11 @@
-import express from 'express';
-import { db } from './db';
-import { initializeDatabase } from './db/schema';
 import { TwitterStream } from '../twitter/stream';
 import { DEXScreenerAPI } from '../chain/dex-screener';
 import { ReplyEngine } from '../automation/reply-engine';
 import { TradingExecutor } from '../trading/executor';
+import { RateLimiter } from '../utils/rate-limiter';
+import { Logger } from '../utils/logger';
+
+const logger = Logger.getInstance();
 
 class XKOLAutomation {
   private app: express.Application;
@@ -13,21 +14,27 @@ class XKOLAutomation {
   private replyEngine?: ReplyEngine;
   private tradingExecutor?: TradingExecutor;
   private isRunning: boolean = false;
+  private dataCollectionInterval?: NodeJS.Timeout;
+  private signalGenerationInterval?: NodeJS.Timeout;
+  private rateLimiter: RateLimiter;
+  private startTime: Date;
 
   constructor() {
     this.app = express();
+    this.rateLimiter = new RateLimiter({ maxCalls: 50, timeWindowMs: 900000 });
+    this.startTime = new Date();
     this.initializeMiddleware();
     this.initializeRoutes();
   }
 
   async initialize() {
-    console.log('Initializing X KOL Automation System...');
+    logger.info('Initializing X KOL Automation System...');
 
     try {
       await initializeDatabase();
-      console.log('Database initialized');
+      logger.info('Database initialized successfully');
     } catch (error) {
-      console.error('Failed to initialize database:', error);
+      logger.error('Failed to initialize database:', 'db', error);
       throw error;
     }
 
@@ -41,7 +48,9 @@ class XKOLAutomation {
     this.dexScreener = new DEXScreenerAPI();
 
     if (process.env.OPENAI_API_KEY) {
-      this.replyEngine = new ReplyEngine(process.env.OPENAI_API_KEY);
+      this.replyEngine = new ReplyEngine(process.env.OPENAI_API_KEY, this.twitterStream);
+    } else {
+      logger.warn('OPENAI_API_KEY not set - content generation disabled');
     }
 
     if (process.env.SOLANA_RPC_URL && process.env.PRIVATE_KEY) {
@@ -49,102 +58,158 @@ class XKOLAutomation {
         process.env.SOLANA_RPC_URL,
         process.env.PRIVATE_KEY
       );
+    } else {
+      logger.info('SOLANA_RPC_URL or PRIVATE_KEY not set - trading disabled');
     }
 
-    console.log('System initialized successfully');
+    logger.info('System initialization completed');
   }
 
   async start() {
     if (this.isRunning) {
-      console.log('System already running');
+      logger.warn('System already running');
       return;
     }
 
-    console.log('Starting X KOL Automation System...');
+    logger.info('Starting X KOL Automation System...');
     this.isRunning = true;
 
-    if (this.twitterStream) {
+    if (this.twitterStream && this.replyEngine) {
       const influencers = [
         'elonmusk', 'cz_binance', 'vitalikbuterin', 'APompliano',
         'scottmelker', 'CryptoCobain', 'HsakaTrades', 'loomdart'
       ];
-      const keywords = ['#crypto', '#bitcoin', '#ethereum', '#solana', '#meme', 'degen'];
+      const keywords = [
+        '#crypto', '#bitcoin', '#ethereum', '#solana', '#meme', 'degen',
+        'altcoin', 'defi', 'nft', 'web3'
+      ];
 
       this.twitterStream.startTracking(influencers, keywords, this.handleTweet.bind(this));
-      console.log('Twitter stream started');
+      logger.info(`Twitter stream started - tracking ${influencers.length} influencers and ${keywords.length} keywords`);
     }
 
     this.startDataCollection();
     this.startSignalGeneration();
+    this.startHealthCheck();
   }
 
   async stop() {
-    console.log('Stopping X KOL Automation System...');
+    logger.info('Stopping X KOL Automation System...');
     this.isRunning = false;
+
+    if (this.dataCollectionInterval) {
+      clearInterval(this.dataCollectionInterval);
+    }
+    if (this.signalGenerationInterval) {
+      clearInterval(this.signalGenerationInterval);
+    }
 
     if (this.twitterStream) {
       this.twitterStream.stop();
     }
 
-    console.log('System stopped');
+    logger.info('System stopped');
   }
 
   private async handleTweet(tweet: any): Promise<void> {
     try {
-      console.log(`Processing tweet from @${tweet.user.screen_name}: ${tweet.text.substring(0, 100)}...`);
+      if (!this.replyEngine) return;
 
-      if (this.replyEngine) {
-        const replies = await this.replyEngine.processTweet(tweet, 1);
-        console.log(`Generated ${replies.length} replies`);
-      }
+      logger.info(`Processing tweet from @${tweet.user.screen_name}: ${tweet.text.substring(0, 80)}...`);
+      
+      const replies = await this.replyEngine.processTweet(tweet, 1, undefined, true);
+      logger.info(`Generated ${replies.length} engagement actions for tweet ${tweet.id_str}`);
 
       if (this.dexScreener) {
-        const trending = await this.dexScreener.getTrendingTokens();
-        console.log(`Found ${trending.length} trending tokens`);
+        try {
+          const trending = await this.dexScreener.getTrendingTokens();
+          if (trending.length > 0) {
+            logger.debug(`Found ${trending.length} trending tokens`, 'dex', { 
+              topToken: trending[0]?.symbol,
+              topPrice: trending[0]?.price 
+            });
+          }
+        } catch (error) {
+          logger.error('Error fetching trending tokens:', 'dex', error);
+        }
       }
     } catch (error) {
-      console.error('Error handling tweet:', error);
+      logger.error('Error handling tweet:', 'twitter', error);
     }
   }
 
-  private async startDataCollection(): Promise<void> {
-    setInterval(async () => {
+  private startDataCollection(): void {
+    this.dataCollectionInterval = setInterval(async () => {
       try {
         if (this.dexScreener) {
           const trending = await this.dexScreener.getTrendingTokens();
-          console.log(`Data collection: ${trending.length} trending tokens`);
+          logger.info(`Data collection cycle: ${trending.length} trending tokens`, 'dex');
         }
       } catch (error) {
-        console.error('Data collection error:', error);
+        logger.error('Data collection error:', 'dex', error);
       }
     }, 5 * 60 * 1000);
   }
 
-  private async startSignalGeneration(): Promise<void> {
-    setInterval(async () => {
+  private startSignalGeneration(): void {
+    this.signalGenerationInterval = setInterval(async () => {
       try {
         if (this.tradingExecutor && this.dexScreener) {
-          const trending = await this.dexScreener.getTopGainers();
-          console.log(`Signal generation: analyzing ${trending.length} top gainers`);
+          const gainers = await this.dexScreener.getTopGainers();
+          const volumeSpikes = await this.dexScreener.getVolumeSpikes();
+          
+          logger.info(`Signal generation: ${gainers.length} gainers, ${volumeSpikes.length} volume spikes`, 'trading');
+          
+          if (gainers.length > 0) {
+            logger.debug('Top gainers:', 'trading', gainers.slice(0, 3).map(t => ({
+              symbol: t.symbol,
+              price: t.price,
+              change: t.change_24h
+            })));
+          }
         }
       } catch (error) {
-        console.error('Signal generation error:', error);
+        logger.error('Signal generation error:', 'trading', error);
       }
     }, 15 * 60 * 1000);
+  }
+
+  private startHealthCheck(): void {
+    setInterval(() => {
+      try {
+        const stats = logger.getStats();
+        const health = this.getHealthStatus();
+        
+        if (stats.error > 0) {
+          logger.warn(`Health check: ${stats.error} errors in last cycle`, 'health');
+        }
+        
+        logger.debug('Health check completed', 'health', health);
+      } catch (error) {
+        logger.error('Health check failed:', 'health', error);
+      }
+    }, 5 * 60 * 1000);
   }
 
   getHealthStatus(): any {
     return {
       isRunning: this.isRunning,
+      uptime: process.uptime(),
+      startTime: this.startTime.toISOString(),
       processedTweets: this.replyEngine?.getProcessedCount() || 0,
       activeTrades: this.tradingExecutor?.getAllActiveTrades().length || 0,
-      uptime: process.uptime()
+      rateLimiter: this.rateLimiter.getRemainingCalls(),
+      logs: logger.getStats()
     };
   }
 
   private initializeMiddleware(): void {
     this.app.use(express.json());
     this.app.use(express.urlencoded({ extended: true }));
+    this.app.use((req, res, next) => {
+      logger.debug(`${req.method} ${req.path}`, 'http');
+      next();
+    });
   }
 
   private initializeRoutes(): void {
@@ -157,13 +222,25 @@ class XKOLAutomation {
         system: 'X KOL Automation',
         version: '1.0.0',
         status: this.isRunning ? 'running' : 'stopped',
+        startTime: this.startTime.toISOString(),
+        uptime: process.uptime(),
         components: {
           twitter: !!this.twitterStream,
           dexScreener: !!this.dexScreener,
           replyEngine: !!this.replyEngine,
           tradingExecutor: !!this.tradingExecutor
+        },
+        config: {
+          port: process.env.PORT,
+          nodeEnv: process.env.NODE_ENV
         }
       });
+    });
+
+    this.app.get('/logs', (req, res) => {
+      const level = req.query.level as any;
+      const logs = logger.getLogs(level, 100);
+      res.json({ logs, stats: logger.getStats() });
     });
 
     this.app.post('/start', async (req, res) => {
@@ -171,7 +248,8 @@ class XKOLAutomation {
         await this.start();
         res.json({ success: true, message: 'System started' });
       } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        logger.error('Failed to start system:', 'api', error);
+        res.status(500).json({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
       }
     });
 
@@ -180,8 +258,43 @@ class XKOLAutomation {
         await this.stop();
         res.json({ success: true, message: 'System stopped' });
       } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        logger.error('Failed to stop system:', 'api', error);
+        res.status(500).json({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
       }
+    });
+
+    this.app.get('/rate-limit', (req, res) => {
+      res.json({
+        remaining: this.rateLimiter.getRemainingCalls(),
+        nextAvailable: this.rateLimiter.getNextAvailable()
+      });
+    });
+
+    this.app.get('/engagement', (req, res) => {
+      if (this.replyEngine) {
+        const history = this.replyEngine.getEngagementHistory();
+        const recent = Array.from(history.entries())
+          .filter(([_, time]) => Date.now() - time.getTime() < 24 * 60 * 60 * 1000);
+        res.json({ 
+          totalProcessed: this.replyEngine.getProcessedCount(),
+          recentEngagements: recent.length,
+          history: Array.from(history.entries()).slice(-50)
+        });
+      } else {
+        res.json({ error: 'Reply engine not initialized' });
+      }
+    });
+
+    this.app.use((req, res) => {
+      res.status(404).json({ error: 'Not found' });
+    });
+
+    this.app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+      logger.error(`Request error ${req.method} ${req.path}:`, 'api', err);
+      res.status(500).json({ 
+        error: 'Internal server error',
+        message: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
     });
   }
 
